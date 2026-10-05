@@ -22,5 +22,8 @@
     <color name="status_offline">#DC2626</color>
     <color name="status_offline_bg">#FEE2E2</color>
 
+    <color name="danger">#DC2626</color>
+    <color name="success">#16A34A</color>
+
     <color name="card_stroke">#E2E8F0</color>
 </resources>
