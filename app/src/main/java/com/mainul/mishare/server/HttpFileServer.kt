@@ -7,9 +7,13 @@ import com.mainul.mishare.model.SharedFile
 import fi.iki.elonen.NanoHTTPD
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.OutputStream
 import java.net.URLDecoder
+import java.net.URLEncoder
+import java.util.Collections
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class HttpFileServer(
     private val context: Context,
@@ -18,40 +22,39 @@ class HttpFileServer(
 ) : NanoHTTPD(port) {
 
     private val gson = Gson()
-    private val sharedFiles = mutableListOf<SharedFile>()
-    private val receivedFiles = mutableListOf<SharedFile>()
+    private val sharedFiles = Collections.synchronizedList(mutableListOf<SharedFile>())
+    private val receivedFiles = Collections.synchronizedList(mutableListOf<SharedFile>())
 
     private val receivedDir: File by lazy {
         val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val dir = File(downloadDir, "MiShare")
-        if (!dir.exists()) {
-            dir.mkdirs()
-        }
+        if (!dir.exists()) dir.mkdirs()
         dir
     }
 
     init {
-        loadExistingReceivedFiles()
-    }
-
-    private fun loadExistingReceivedFiles() {
-        if (receivedDir.exists() && receivedDir.isDirectory) {
-            receivedDir.listFiles()?.sortedByDescending { it.lastModified() }?.forEach { file ->
-                if (file.isFile) {
-                    receivedFiles.add(
-                        SharedFile(
-                            id = "rec_" + file.name.hashCode(),
-                            name = file.name,
-                            size = file.length(),
-                            mimeType = resolveMimeType(file.name),
-                            uri = null,
-                            localPath = file.absolutePath,
-                            isReceived = true,
-                            timestamp = file.lastModified()
+        // Populate existing received files
+        try {
+            if (receivedDir.exists() && receivedDir.isDirectory) {
+                receivedDir.listFiles()?.sortedByDescending { it.lastModified() }?.forEach { file ->
+                    if (file.isFile) {
+                        receivedFiles.add(
+                            SharedFile(
+                                id = "rec_" + file.name.hashCode(),
+                                name = file.name,
+                                size = file.length(),
+                                mimeType = resolveMimeType(file.name),
+                                uri = null,
+                                localPath = file.absolutePath,
+                                isReceived = true,
+                                timestamp = file.lastModified()
+                            )
                         )
-                    )
+                    }
                 }
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -62,15 +65,9 @@ class HttpFileServer(
         }
     }
 
-    fun getSharedFiles(): List<SharedFile> {
-        synchronized(sharedFiles) {
-            return ArrayList(sharedFiles)
-        }
-    }
-
     fun getReceivedFiles(): List<SharedFile> {
-        synchronized(receivedFiles) {
-            return ArrayList(receivedFiles)
+        return synchronized(receivedFiles) {
+            ArrayList(receivedFiles)
         }
     }
 
@@ -78,21 +75,33 @@ class HttpFileServer(
         val uri = session.uri
         val method = session.method
 
+        // Handle CORS preflight
+        if (method == Method.OPTIONS) {
+            val response = newFixedLengthResponse(Response.Status.OK, "text/plain", "")
+            addCorsHeaders(response)
+            return response
+        }
+
         try {
             // Static Web Client
             if (uri == "/" || uri == "/index.html") {
-                return serveAsset("web/index.html", "text/html")
+                val res = serveAsset("web/index.html", "text/html; charset=UTF-8")
+                addCorsHeaders(res)
+                return res
             }
 
             // API: Status
             if (uri == "/api/status" && method == Method.GET) {
                 val status = mapOf(
                     "status" to "online",
-                    "device" to android.os.Build.MODEL,
+                    "device" to "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}",
                     "sharedCount" to sharedFiles.size,
-                    "receivedCount" to receivedFiles.size
+                    "receivedCount" to receivedFiles.size,
+                    "timestamp" to System.currentTimeMillis()
                 )
-                return newFixedLengthResponse(Response.Status.OK, "application/json", gson.toJson(status))
+                val res = newFixedLengthResponse(Response.Status.OK, "application/json", gson.toJson(status))
+                addCorsHeaders(res)
+                return res
             }
 
             // API: Files staged from Mobile
@@ -103,14 +112,17 @@ class HttpFileServer(
                             "id" to it.id,
                             "name" to it.name,
                             "size" to it.size,
-                            "mimeType" to it.mimeType
+                            "mimeType" to it.mimeType,
+                            "timestamp" to it.timestamp
                         )
                     }
                 }
-                return newFixedLengthResponse(Response.Status.OK, "application/json", gson.toJson(list))
+                val res = newFixedLengthResponse(Response.Status.OK, "application/json", gson.toJson(list))
+                addCorsHeaders(res)
+                return res
             }
 
-            // API: Download a file to PC
+            // API: Download a single file to PC
             if (uri.startsWith("/api/download/")) {
                 val fileId = uri.substringAfter("/api/download/")
                 val target = synchronized(sharedFiles) {
@@ -118,23 +130,84 @@ class HttpFileServer(
                 }
 
                 if (target != null) {
-                    val stream: InputStream? = if (target.uri != null) {
-                        context.contentResolver.openInputStream(target.uri)
-                    } else if (target.localPath != null) {
-                        FileInputStream(File(target.localPath))
-                    } else null
+                    val localFile = if (target.localPath != null) File(target.localPath) else null
+                    val stream: InputStream? = when {
+                        localFile != null && localFile.exists() -> FileInputStream(localFile)
+                        target.uri != null -> {
+                            try {
+                                context.contentResolver.openInputStream(target.uri)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                null
+                            }
+                        }
+                        else -> null
+                    }
+
+                    val totalLength = when {
+                        localFile != null && localFile.exists() -> localFile.length()
+                        target.size > 0 -> target.size
+                        else -> stream?.available()?.toLong() ?: -1L
+                    }
 
                     if (stream != null) {
-                        val response = newChunkedResponse(Response.Status.OK, target.mimeType, stream)
+                        val response = if (totalLength >= 0) {
+                            newFixedLengthResponse(Response.Status.OK, target.mimeType, stream, totalLength)
+                        } else {
+                            newChunkedResponse(Response.Status.OK, target.mimeType, stream)
+                        }
+
+                        val encodedName = URLEncoder.encode(target.name, "UTF-8").replace("+", "%20")
+                        val safeName = target.name.replace("\"", "\\\"")
                         response.addHeader(
                             "Content-Disposition",
-                            "attachment; filename=\"${target.name}\""
+                            "attachment; filename=\"$safeName\"; filename*=UTF-8''$encodedName"
                         )
-                        response.addHeader("Content-Length", target.size.toString())
+                        response.addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+                        addCorsHeaders(response)
                         return response
                     }
                 }
-                return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "File not found")
+                val notFound = newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "File not found or unreadable on device")
+                addCorsHeaders(notFound)
+                return notFound
+            }
+
+            // API: Download all files as a ZIP archive
+            if (uri == "/api/download-all" && method == Method.GET) {
+                val filesSnapshot = synchronized(sharedFiles) { ArrayList(sharedFiles) }
+                if (filesSnapshot.isEmpty()) {
+                    val res = newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "No files to download")
+                    addCorsHeaders(res)
+                    return res
+                }
+
+                // Create temp zip file in cache
+                val tempZip = File(context.cacheDir, "MiShare_bundle_${System.currentTimeMillis()}.zip")
+                ZipOutputStream(FileOutputStream(tempZip)).use { zos ->
+                    for (file in filesSnapshot) {
+                        val inputStream: InputStream? = when {
+                            file.localPath != null && File(file.localPath).exists() -> FileInputStream(File(file.localPath))
+                            file.uri != null -> {
+                                try { context.contentResolver.openInputStream(file.uri) } catch (e: Exception) { null }
+                            }
+                            else -> null
+                        }
+
+                        if (inputStream != null) {
+                            zos.putNextEntry(ZipEntry(file.name))
+                            inputStream.copyTo(zos)
+                            zos.closeEntry()
+                            inputStream.close()
+                        }
+                    }
+                }
+
+                val zipStream = FileInputStream(tempZip)
+                val response = newFixedLengthResponse(Response.Status.OK, "application/zip", zipStream, tempZip.length())
+                response.addHeader("Content-Disposition", "attachment; filename=\"MiShare_files.zip\"")
+                addCorsHeaders(response)
+                return response
             }
 
             // API: Upload files from PC to Mobile
@@ -143,7 +216,6 @@ class HttpFileServer(
                 session.parseBody(files)
 
                 val params = session.parameters
-                // Check uploaded files
                 for ((key, tempFilePath) in files) {
                     if (key != "postData") {
                         val originalFileName = params[key]?.firstOrNull() ?: "file_${System.currentTimeMillis()}"
@@ -171,15 +243,27 @@ class HttpFileServer(
                         onFileUploaded?.invoke(newReceived)
                     }
                 }
-                return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"success\":true}")
+                val res = newFixedLengthResponse(Response.Status.OK, "application/json", "{\"success\":true}")
+                addCorsHeaders(res)
+                return res
             }
 
         } catch (e: Exception) {
             e.printStackTrace()
-            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Server Error: ${e.message}")
+            val err = newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Server Error: ${e.message}")
+            addCorsHeaders(err)
+            return err
         }
 
-        return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
+        val res = newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
+        addCorsHeaders(res)
+        return res
+    }
+
+    private fun addCorsHeaders(response: Response) {
+        response.addHeader("Access-Control-Allow-Origin", "*")
+        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        response.addHeader("Access-Control-Allow-Headers", "Content-Type, Range")
     }
 
     private fun getUniqueFile(directory: File, fileName: String): File {
@@ -219,7 +303,8 @@ class HttpFileServer(
             "zip" -> "application/zip"
             "apk" -> "application/vnd.android.package-archive"
             "txt" -> "text/plain"
-            "json" -> "application/json"
+            "html" -> "text/html"
+            "doc", "docx" -> "application/msword"
             else -> "application/octet-stream"
         }
     }

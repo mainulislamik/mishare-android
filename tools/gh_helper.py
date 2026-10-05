@@ -38,8 +38,28 @@ def get_job_log(job_id):
                     if "e: " in line or "error" in line.lower() or "what went wrong" in line.lower():
                         print(line)
 
+def get_latest_run():
+    token = get_token()
+    url = "https://api.github.com/repos/mainulislamik/mishare-android/actions/runs"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            runs = data.get("workflow_runs", [])
+            if runs:
+                r = runs[0]
+                print(f"Run #{r['run_number']}: id={r['id']} - status={r['status']} - conclusion={r['conclusion']}")
+                return r
+    except Exception as e:
+        print("Error fetching runs:", e)
+    return None
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1] == "latest":
+        get_latest_run()
+    elif len(sys.argv) > 1:
         get_job_log(sys.argv[1])
     else:
-        print("Usage: python3 gh_helper.py <job_id>")
+        print("Usage: python3 gh_helper.py [latest | <job_id>]")

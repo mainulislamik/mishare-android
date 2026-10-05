@@ -16,25 +16,80 @@ import com.mainul.mishare.MiShareApplication
 import com.mainul.mishare.R
 import com.mainul.mishare.model.SharedFile
 import com.mainul.mishare.utils.NetworkUtils
+import java.io.File
+import java.util.Collections
 
 class FileServerService : Service() {
 
     companion object {
         const val ACTION_START = "com.mainul.mishare.ACTION_START"
         const val ACTION_STOP = "com.mainul.mishare.ACTION_STOP"
-        const val EXTRA_PORT = "com.mainul.mishare.EXTRA_PORT"
-
+        const val EXTRA_PORT = "EXTRA_PORT"
         const val NOTIFICATION_ID = 1001
 
-        var isRunning: Boolean = false
+        var isRunning = false
             private set
+
+        var currentPort = 8888
+            private set
+
         var currentServer: HttpFileServer? = null
             private set
-        var currentPort: Int = 8888
-            private set
+
+        val stagedFiles = Collections.synchronizedList(mutableListOf<SharedFile>())
 
         var onStateChangeListener: ((Boolean) -> Unit)? = null
         var onFileUploadedListener: ((SharedFile) -> Unit)? = null
+        var onStagedFilesChangedListener: (() -> Unit)? = null
+
+        fun addStagedFile(file: SharedFile) {
+            synchronized(stagedFiles) {
+                stagedFiles.removeAll { it.id == file.id || (it.localPath != null && it.localPath == file.localPath) }
+                stagedFiles.add(0, file)
+            }
+            currentServer?.setSharedFiles(stagedFiles)
+            onStagedFilesChangedListener?.invoke()
+        }
+
+        fun removeStagedFile(fileId: String) {
+            var localPathToDelete: String? = null
+            synchronized(stagedFiles) {
+                val target = stagedFiles.find { it.id == fileId }
+                if (target != null) {
+                    localPathToDelete = target.localPath
+                    stagedFiles.remove(target)
+                }
+            }
+            // If it was cached in staging, delete temp file
+            localPathToDelete?.let {
+                try {
+                    val f = File(it)
+                    if (f.exists() && it.contains("shared_staging")) f.delete()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+            currentServer?.setSharedFiles(stagedFiles)
+            onStagedFilesChangedListener?.invoke()
+        }
+
+        fun clearStagedFiles() {
+            synchronized(stagedFiles) {
+                for (file in stagedFiles) {
+                    file.localPath?.let {
+                        try {
+                            val f = File(it)
+                            if (f.exists() && it.contains("shared_staging")) f.delete()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+                stagedFiles.clear()
+            }
+            currentServer?.setSharedFiles(stagedFiles)
+            onStagedFilesChangedListener?.invoke()
+        }
     }
 
     private var server: HttpFileServer? = null
@@ -70,6 +125,7 @@ class FileServerService : Service() {
             server = HttpFileServer(this, port) { uploadedFile ->
                 onFileUploadedListener?.invoke(uploadedFile)
             }
+            server?.setSharedFiles(stagedFiles)
             server?.start()
 
             currentServer = server
@@ -129,7 +185,7 @@ class FileServerService : Service() {
 
         return NotificationCompat.Builder(this, MiShareApplication.CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText("Access at $url")
+            .setContentText("Sharing files at $url")
             .setSmallIcon(R.drawable.ic_wifi)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -140,19 +196,13 @@ class FileServerService : Service() {
 
     private fun acquireLocks() {
         try {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "MiShare::ServerWakeLock"
-            ).apply {
-                acquire(10 * 60 * 60 * 1000L) // 10 hours
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MiShare::ServerWakeLock").apply {
+                acquire(12 * 60 * 60 * 1000L) // 12 hours max
             }
 
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wifiLock = wifiManager.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                "MiShare::ServerWifiLock"
-            ).apply {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "MiShare::ServerWifiLock").apply {
                 acquire()
             }
         } catch (e: Exception) {
@@ -162,9 +212,9 @@ class FileServerService : Service() {
 
     private fun releaseLocks() {
         try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
+            wakeLock?.let { if (it.isHeld) it.release() }
             wakeLock = null
-            if (wifiLock?.isHeld == true) wifiLock?.release()
+            wifiLock?.let { if (it.isHeld) it.release() }
             wifiLock = null
         } catch (e: Exception) {
             e.printStackTrace()
@@ -172,7 +222,7 @@ class FileServerService : Service() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         stopServer()
+        super.onDestroy()
     }
 }

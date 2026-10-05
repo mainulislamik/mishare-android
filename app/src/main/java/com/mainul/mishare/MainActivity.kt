@@ -15,6 +15,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.mainul.mishare.adapter.ReceivedFileAdapter
 import com.mainul.mishare.adapter.SharedFileAdapter
@@ -23,7 +24,11 @@ import com.mainul.mishare.model.SharedFile
 import com.mainul.mishare.server.FileServerService
 import com.mainul.mishare.utils.NetworkUtils
 import com.mainul.mishare.utils.QrCodeHelper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
@@ -36,16 +41,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sharedAdapter: SharedFileAdapter
     private lateinit var receivedAdapter: ReceivedFileAdapter
 
+    // Use OpenMultipleDocuments for broad storage permission access
     private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri>? ->
+        uris?.let { if (it.isNotEmpty()) stageSelectedUris(it) }
+    }
+
+    // Fallback picker
+    private val fallbackPickerLauncher = registerForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri>? ->
-        uris?.let { handleSelectedUris(it) }
+        uris?.let { if (it.isNotEmpty()) stageSelectedUris(it) }
     }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        // Continue regardless of optional permissions
+    ) { _ ->
+        // Continue
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,6 +77,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         updateNetworkInfo()
         updateUiState(FileServerService.isRunning)
+        refreshSharedFiles()
         refreshReceivedFiles()
 
         FileServerService.onStateChangeListener = { isRunning ->
@@ -78,6 +92,12 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Received: ${newFile.name}", Toast.LENGTH_SHORT).show()
             }
         }
+
+        FileServerService.onStagedFilesChangedListener = {
+            runOnUiThread {
+                refreshSharedFiles()
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -87,10 +107,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupRecyclerViews() {
         sharedAdapter = SharedFileAdapter(sharedFilesList) { fileToRemove ->
-            sharedFilesList.remove(fileToRemove)
-            sharedAdapter.updateList(sharedFilesList)
-            updateSharedFilesState()
-            FileServerService.currentServer?.setSharedFiles(sharedFilesList)
+            FileServerService.removeStagedFile(fileToRemove.id)
+            refreshSharedFiles()
         }
         binding.rvSharedFiles.layoutManager = LinearLayoutManager(this)
         binding.rvSharedFiles.adapter = sharedAdapter
@@ -116,7 +134,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnAddFiles.setOnClickListener {
-            filePickerLauncher.launch("*/*")
+            try {
+                filePickerLauncher.launch(arrayOf("*/*"))
+            } catch (e: Exception) {
+                fallbackPickerLauncher.launch("*/*")
+            }
+        }
+
+        binding.btnClearShared.setOnClickListener {
+            FileServerService.clearStagedFiles()
+            refreshSharedFiles()
+            Toast.makeText(this, "Cleared staged files", Toast.LENGTH_SHORT).show()
         }
 
         binding.btnCopyUrl.setOnClickListener {
@@ -124,7 +152,18 @@ class MainActivity : AppCompatActivity() {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = ClipData.newPlainText("MiShare URL", url)
             clipboard.setPrimaryClip(clip)
-            Toast.makeText(this, "URL copied to clipboard", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "URL copied! Open in PC browser", Toast.LENGTH_SHORT).show()
+        }
+
+        // Share link via messaging/email to PC
+        binding.btnShareLink.setOnClickListener {
+            val url = binding.tvServerUrl.text.toString()
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "MiShare PC Link")
+                putExtra(Intent.EXTRA_TEXT, "Open this link on your PC to download/upload files: $url")
+            }
+            startActivity(Intent.createChooser(shareIntent, "Share link to PC"))
         }
     }
 
@@ -138,8 +177,6 @@ class MainActivity : AppCompatActivity() {
         } else {
             startService(intent)
         }
-        // Push any existing staged files to server
-        FileServerService.currentServer?.setSharedFiles(sharedFilesList)
     }
 
     private fun stopServer() {
@@ -171,8 +208,6 @@ class MainActivity : AppCompatActivity() {
                 binding.imgQrCode.setImageBitmap(qrBitmap)
                 binding.layoutQrSection.visibility = View.VISIBLE
             }
-
-            FileServerService.currentServer?.setSharedFiles(sharedFilesList)
         } else {
             binding.tvStatusBadge.text = getString(R.string.server_status_offline)
             binding.tvStatusBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.status_offline_bg))
@@ -186,7 +221,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         updateNetworkInfo()
-        updateSharedFilesState()
+        refreshSharedFiles()
     }
 
     private fun updateNetworkInfo() {
@@ -194,53 +229,92 @@ class MainActivity : AppCompatActivity() {
         binding.tvWifiBadge.text = ssid
     }
 
-    private fun handleSelectedUris(uris: List<Uri>) {
-        for (uri in uris) {
-            val file = queryFileDetails(uri)
-            if (file != null && sharedFilesList.none { it.uri == uri }) {
-                sharedFilesList.add(file)
+    /**
+     * Cache/Stage files into local internal storage to prevent Uri permission expiration,
+     * allow high-speed zero-latency streaming to PC, and eliminate Android permission denial.
+     */
+    private fun stageSelectedUris(uris: List<Uri>) {
+        Toast.makeText(this, "Staging ${uris.size} file(s)...", Toast.LENGTH_SHORT).show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val stagingDir = File(cacheDir, "shared_staging")
+            if (!stagingDir.exists()) stagingDir.mkdirs()
+
+            for (uri in uris) {
+                try {
+                    // Try persistable permission if possible
+                    try {
+                        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    } catch (_: Exception) {}
+
+                    var name = "file_${System.currentTimeMillis()}"
+                    var size: Long = 0
+                    val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+
+                    contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (cursor.moveToFirst()) {
+                            if (nameIndex != -1) name = cursor.getString(nameIndex)
+                            if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+                        }
+                    }
+
+                    // Copy file to cache for permanent access during transfer
+                    val cleanSafeName = name.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
+                    val targetCacheFile = File(stagingDir, "${System.currentTimeMillis()}_$cleanSafeName")
+
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(targetCacheFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+
+                    if (targetCacheFile.exists() && targetCacheFile.length() > 0) {
+                        val shared = SharedFile(
+                            id = UUID.randomUUID().toString(),
+                            name = name,
+                            size = targetCacheFile.length(),
+                            mimeType = mimeType,
+                            uri = uri,
+                            localPath = targetCacheFile.absolutePath,
+                            timestamp = System.currentTimeMillis()
+                        )
+                        FileServerService.addStagedFile(shared)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                refreshSharedFiles()
+                // Auto start server if not running so user can download right away
+                if (!FileServerService.isRunning) {
+                    startServer()
+                }
+                Toast.makeText(
+                    this@MainActivity,
+                    "Files ready! Download them on your PC browser.",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
+    }
+
+    private fun refreshSharedFiles() {
+        sharedFilesList.clear()
+        sharedFilesList.addAll(FileServerService.stagedFiles)
         sharedAdapter.updateList(sharedFilesList)
-        updateSharedFilesState()
-        FileServerService.currentServer?.setSharedFiles(sharedFilesList)
 
-        // Auto start server if not running
-        if (!FileServerService.isRunning) {
-            startServer()
-        }
-    }
-
-    private fun queryFileDetails(uri: Uri): SharedFile? {
-        var name = "file_${System.currentTimeMillis()}"
-        var size: Long = 0
-        val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-            if (cursor.moveToFirst()) {
-                if (nameIndex != -1) name = cursor.getString(nameIndex)
-                if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
-            }
-        }
-
-        return SharedFile(
-            id = UUID.randomUUID().toString(),
-            name = name,
-            size = size,
-            mimeType = mimeType,
-            uri = uri
-        )
-    }
-
-    private fun updateSharedFilesState() {
         if (sharedFilesList.isEmpty()) {
             binding.tvEmptyShared.visibility = View.VISIBLE
             binding.rvSharedFiles.visibility = View.GONE
+            binding.btnClearShared.visibility = View.GONE
         } else {
             binding.tvEmptyShared.visibility = View.GONE
             binding.rvSharedFiles.visibility = View.VISIBLE
+            binding.btnClearShared.visibility = View.VISIBLE
         }
     }
 
@@ -271,7 +345,7 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(Intent.EXTRA_STREAM)
             }
-            uri?.let { handleSelectedUris(listOf(it)) }
+            uri?.let { stageSelectedUris(listOf(it)) }
         } else if (Intent.ACTION_SEND_MULTIPLE == action && type != null) {
             val uris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
@@ -279,7 +353,7 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
             }
-            uris?.let { handleSelectedUris(it) }
+            uris?.let { stageSelectedUris(it) }
         }
     }
 

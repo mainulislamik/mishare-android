@@ -145,6 +145,15 @@
                             android:text="@string/copy_url"
                             android:textColor="@color/secondary"
                             android:textSize="12sp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnShareLink"
+                            style="@style/Widget.MaterialComponents.Button.TextButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Share Link"
+                            android:textColor="@color/secondary"
+                            android:textSize="12sp" />
                     </LinearLayout>
 
                     <!-- QR Code View -->
@@ -218,9 +227,20 @@
                             android:textStyle="bold" />
 
                         <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnClearShared"
+                            style="@style/Widget.MaterialComponents.Button.TextButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/clear_shared"
+                            android:textColor="@color/danger"
+                            android:textSize="12sp"
+                            android:visibility="gone" />
+
+                        <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnAddFiles"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
+                            android:layout_marginStart="8dp"
                             android:backgroundTint="@color/secondary"
                             android:text="@string/btn_add_files"
                             android:textColor="@color/on_secondary"
