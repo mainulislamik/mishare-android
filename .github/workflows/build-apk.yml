@@ -1,0 +1,73 @@
+name: Build and Release Android APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build MiShare APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Gradle
+        run: chmod +x gradlew
+
+      - name: Build Debug and Release APK
+        run: ./gradlew assembleDebug assembleRelease --stacktrace
+
+      - name: Rename APKs for Distribution
+        run: |
+          mkdir -p output_apks
+          cp app/build/outputs/apk/debug/app-debug.apk output_apks/MiShare-debug.apk
+          if [ -f app/build/outputs/apk/release/app-release-unsigned.apk ]; then
+            cp app/build/outputs/apk/release/app-release-unsigned.apk output_apks/MiShare-release.apk
+          elif [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk output_apks/MiShare-release.apk
+          fi
+
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiShare-Android-APK
+          path: output_apks/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+        with:
+          tag_name: v1.0.0
+          name: "MiShare v1.0.0 — Android APK Release"
+          body: |
+            ### MiShare — High-speed Local Network File Transfer for Android & PC
+            
+            **Download the APK to your Android device:**
+            - `MiShare-debug.apk` (Recommended: Ready to install, signed with debug key)
+            - `MiShare-release.apk`
+            
+            **Features:**
+            - Transfer files between Android Phone and PC on the same Wi-Fi / Hotspot.
+            - Zero software needed on PC — works directly in Chrome, Edge, Firefox.
+            - QR Code scan on phone screen.
+            - High-speed local transfer without internet quota.
+          files: output_apks/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

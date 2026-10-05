@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MiShare</string>
+    <string name="server_running">File Server Running</string>
+    <string name="server_stopped">File Server Stopped</string>
+    <string name="start_server">Start Server</string>
+    <string name="stop_server">Stop Server</string>
+    <string name="server_status_online">ONLINE</string>
+    <string name="server_status_offline">OFFLINE</string>
+    <string name="connect_instructions">Open this URL in any PC browser connected to the same Wi-Fi</string>
+    <string name="copy_url">Copy URL</string>
+    <string name="open_browser">Open</string>
+    <string name="qr_instructions">Scan QR Code from PC or phone</string>
+    
+    <string name="tab_share">Share Files</string>
+    <string name="tab_received">Received</string>
+    <string name="btn_add_files">Add Files to Share</string>
+    <string name="clear_shared">Clear All</string>
+    <string name="no_files_shared">No files staged for sharing yet.\nTap \'Add Files to Share\' to select files.</string>
+    <string name="no_files_received">No files received from PC yet.\nFiles sent from PC browser will appear here.</string>
+    <string name="channel_id">mishare_server_channel</string>
+    <string name="channel_name">MiShare File Server</string>
+    <string name="channel_desc">Active transfer notifications for MiShare file sharing service</string>
+    <string name="notification_title">MiShare Server Active</string>
+    <string name="notification_text">Sharing files on your local network</string>
+    <string name="notification_stop">Stop Server</string>
+</resources>
