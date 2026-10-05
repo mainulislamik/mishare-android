@@ -43,7 +43,7 @@ class HttpFileServer(
                             id = "rec_" + file.name.hashCode(),
                             name = file.name,
                             size = file.length(),
-                            mimeType = getMimeTypeForFile(file.name),
+                            mimeType = resolveMimeType(file.name),
                             uri = null,
                             localPath = file.absolutePath,
                             isReceived = true,
@@ -158,7 +158,7 @@ class HttpFileServer(
                             id = "rec_" + targetFile.name.hashCode(),
                             name = targetFile.name,
                             size = targetFile.length(),
-                            mimeType = getMimeTypeForFile(targetFile.name),
+                            mimeType = resolveMimeType(targetFile.name),
                             uri = null,
                             localPath = targetFile.absolutePath,
                             isReceived = true,
@@ -205,7 +205,7 @@ class HttpFileServer(
         }
     }
 
-    private fun getMimeTypeForFile(name: String): String {
+    private fun resolveMimeType(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase()
         return when (ext) {
             "jpg", "jpeg" -> "image/jpeg"
